@@ -537,7 +537,42 @@ function OPERATION_QUICKSALE (ctx, Data, Test, Operation) {
     })
 }
 function GET () {
-    http.response.send(http.HttpStatus.HTTP_OK, 'Extension GuembePOS is up and running!')
+    const SalesPointCode = http.request.getEntityKey()
+    if (!SalesPointCode) {
+        http.response.send(http.HttpStatus.HTTP_OK, 'Extension GuembePOS is up and running!')
+    } else {
+        handleRequest(ctx => {
+            const SalesPoint = unwrapOperation(ctx.get('GPosSalesPoint', SalesPointCode), 'Punto de venta')
+
+            const Catalog = SalesPoint.GPOS_SALESITEMCollection.map(Item => {
+                const {
+                    ItemCode,
+                    ItemName,
+                    ItemPrices,
+                    U_GPOS_AllowManualPrice,
+                    U_GPOS_AllowCredit,
+                    U_GPOS_AllowAffiliate,
+                    U_GPOS_Tags
+                } = unwrapOperation(ctx.get('Items', Item.U_ItemCode))
+    
+                return {
+                    ItemCode,
+                    ItemName,
+                    AllowManualPrice: U_GPOS_AllowManualPrice === 1,
+                    AllowCredit: U_GPOS_AllowCredit === 1,
+                    AllowAffiliate: U_GPOS_AllowAffiliate === 1,
+                    ItemPrices: ItemPrices.map(List => ({ PriceList: List.PriceList, Price: List.Price })),
+                    Tags: U_GPOS_Tags ? U_GPOS_Tags.split(/[^\w]+/) : []
+                }
+            })
+    
+            http.response.send(http.HttpStatus.HTTP_OK, {
+                Code: SalesPoint.Code,
+                Name: SalesPoint.Name,
+                Catalog
+            })
+        })
+    }
 }
 function POST () {
     handleRequest(ctx => {
