@@ -251,7 +251,7 @@ function getPrintInvoices(Invoices, Payment, OperationContext) {
                 throw new http.ScriptException(http.HttpStatus.HTTP_BAD_REQUEST, `Could not find Tax TaxSerie with Code '${Invoice.U_GPOS_TaxSeriesCode}' for printing purposes. Should not happen`)
             }
         }
-        return Object.assign({
+        return {
             DocDate: Invoice.DocDate,
             DocTime: Invoice.DocTime,
             DocTotal: Invoice.DocTotal,
@@ -267,21 +267,22 @@ function getPrintInvoices(Invoices, Payment, OperationContext) {
                     PriceAfterVAT: Item.PriceAfterVAT
                 }
             }),
-        }, TaxSerie ? {
             U_FECHALIM: Invoice.U_FECHALIM,
             U_EXENTO: Invoice.U_EXENTO,
-            U_ACTIVIDAD: TaxSerie.U_ACTIVIDAD,
-            U_LEYENDA: TaxSerie.U_LEYENDA,
-            U_DIRECCION: TaxSerie.U_DIRECCION,
-            U_CIUDAD: TaxSerie.U_CIUDAD,
-            U_PAIS: TaxSerie.U_PAIS,
-            U_SUCURSAL: TaxSerie.U_SUCURSAL,
             U_NRO_FAC: Invoice.U_NRO_FAC,
             U_NROAUTOR: Invoice.U_NROAUTOR,
             U_CODCTRL: Invoice.U_CODCTRL,
             U_NIT: Invoice.U_NIT,
-            U_RAZSOC: Invoice.U_RAZSOC
-        } : {})
+            U_RAZSOC: Invoice.U_RAZSOC,
+            TaxSerie: TaxSerie ? {
+                U_ACTIVIDAD: TaxSerie.U_ACTIVIDAD,
+                U_LEYENDA: TaxSerie.U_LEYENDA,
+                U_DIRECCION: TaxSerie.U_DIRECCION,
+                U_CIUDAD: TaxSerie.U_CIUDAD,
+                U_PAIS: TaxSerie.U_PAIS,
+                U_SUCURSAL: TaxSerie.U_SUCURSAL
+            } : null
+        }
     })
 }
 function createOrder(ctx, Items, OrderType, OperationContext) {
@@ -537,42 +538,7 @@ function OPERATION_QUICKSALE (ctx, Data, Test, Operation) {
     })
 }
 function GET () {
-    const SalesPointCode = http.request.getEntityKey()
-    if (!SalesPointCode) {
-        http.response.send(http.HttpStatus.HTTP_OK, 'Extension GuembePOS is up and running!')
-    } else {
-        handleRequest(ctx => {
-            const SalesPoint = unwrapOperation(ctx.get('GPosSalesPoint', SalesPointCode), 'Punto de venta')
-
-            const Catalog = SalesPoint.GPOS_SALESITEMCollection.map(Item => {
-                const {
-                    ItemCode,
-                    ItemName,
-                    ItemPrices,
-                    U_GPOS_AllowManualPrice,
-                    U_GPOS_AllowCredit,
-                    U_GPOS_AllowAffiliate,
-                    U_GPOS_Tags
-                } = unwrapOperation(ctx.get('Items', Item.U_ItemCode))
-    
-                return {
-                    ItemCode,
-                    ItemName,
-                    AllowManualPrice: U_GPOS_AllowManualPrice === 1,
-                    AllowCredit: U_GPOS_AllowCredit === 1,
-                    AllowAffiliate: U_GPOS_AllowAffiliate === 1,
-                    ItemPrices: ItemPrices.map(List => ({ PriceList: List.PriceList, Price: List.Price })),
-                    Tags: U_GPOS_Tags ? U_GPOS_Tags.split(/[^\w]+/) : []
-                }
-            })
-    
-            http.response.send(http.HttpStatus.HTTP_OK, {
-                Code: SalesPoint.Code,
-                Name: SalesPoint.Name,
-                Catalog
-            })
-        })
-    }
+    http.response.send(http.HttpStatus.HTTP_OK, 'Extension GuembePOS is up and running!')
 }
 function POST () {
     handleRequest(ctx => {
