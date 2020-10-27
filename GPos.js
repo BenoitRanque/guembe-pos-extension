@@ -7,8 +7,10 @@ require('EntityType/LB_CDC_DOS.js')
 
 // Valores para U_GPOS_Type
 const ORDER_TYPE_QUICKSALE = 101
-const ORDER_TYPE_TABLE_OPENED = 102
+const ORDER_TYPE_TABLE_OPEN = 102
 const ORDER_TYPE_TABLE_CLOSED = 103
+const ORDER_TYPE_TABLE_INVOICED = 104
+const ORDER_TYPE_TABLE_CANCELLED = 105
 const INVOICE_TYPE_FISCAL_INVOICE = 201
 const INVOICE_TYPE_NON_FISCAL_INVOICE = 202
 const INVOICE_TYPE_AFILIATE_INVOICE = 203
@@ -69,9 +71,9 @@ function getItemsInfo (ctx, Items) {
         return ItemsInfo
     }, {})
 }
-function getAdditionalExpenses (PriceAfterVAT, Quantity) {
+function getAdditionalExpenses (Price, Quantity) {
     // Calculate Transactional Tax as 3% of line total
-    const LineTotal = Math.round(((PriceAfterVAT * 100) * Quantity) * TRANSACTIONAL_TAX_PERCENT) / 10000
+    const LineTotal = Math.round(((Price * 100) * Quantity) * TRANSACTIONAL_TAX_PERCENT) / 10000
     return [
         {
             ExpenseCode: 2, // IT DEBE
@@ -158,7 +160,7 @@ function getOperationContext (ctx, Data, Test, Operation) {
         Data,
         Operation,
         Today: formatDate(new Date()),
-        ItemsInfo: getItemsInfo(ctx, Data.Items),
+        ItemsInfo: Data.Items ? getItemsInfo(ctx, Data.Items) : null,
         SalesPointCode: Data.SalesPointCode,
         SalesPoint: null, // these to be set later, in transaction
         Branch: null, // these to be set later, in transaction
@@ -198,7 +200,8 @@ function getSaleItemsFromOrder (Order) {
         BaseRef: Order.DocNum,
         BaseEntry: Order.DocEntry,
         BaseType: 17, // BaseType 17 = Order
-        BaseLine: Item.LineNum
+        BaseLine: Item.LineNum,
+        Price: Item.PriceAfterVAT
     }))
 }
 function getSalesPointItem (ItemInfo, SalesPoint) {
@@ -264,7 +267,7 @@ function getPrintInvoices(Invoices, Payment, OperationContext) {
                     ItemCode: Item.ItemCode,
                     ItemDescription: Item.ItemDescription,
                     Quantity: Item.Quantity,
-                    PriceAfterVAT: Item.PriceAfterVAT
+                    Price: Item.PriceAfterVAT
                 }
             }),
             U_FECHALIM: Invoice.U_FECHALIM,
@@ -315,7 +318,7 @@ function createOrder(ctx, Items, OrderType, OperationContext) {
         return {
             ItemCode: Item.ItemCode,
             Quantity: Item.Quantity,
-            PriceAfterVAT: Item.PriceAfterVAT,
+            PriceAfterVAT: Item.Price,
             CostingCode: SalesPointItem.U_CostingCode,
             CostingCode2: SalesPointItem.U_CostingCode2,
             WarehouseCode: SalesPointItem.U_WarehouseCode,
@@ -341,6 +344,63 @@ function createOrder(ctx, Items, OrderType, OperationContext) {
 
     return {
         Order: unwrapOperation(ctx.add('Orders', OrderInput))
+    }
+}
+function updateOrder(ctx, Items, OrderType, OperationContext) {
+    // this function has side effects. Specifically OperationContext.SalesPoint will be mutated
+    const { SalesPoint, ItemsInfo, BusinessPartner, SalesPersonCode, SalesPointCode, Branch, Today } = OperationContext 
+    const DocumentLines = Items.map(Item => {
+        const ItemInfo = ItemsInfo[Item.ItemCode]
+        const SalesPointItem = getSalesPointItem(ItemInfo, SalesPoint)
+
+        // item must either be tax exempt OR have a TaxGroup
+        if (ItemInfo.VatLiable && ItemInfo.TaxGroup === 0) {
+            throw new http.ScriptException(http.HttpStatus.HTTP_BAD_REQUEST, `Articulo '${ItemInfo.ItemName}' (${ItemInfo.ItemCode}) sujeto a impuesto debe tener rubro`)
+        }
+        if (!ItemInfo.VatLiable && ItemInfo.TaxGroup !== 0) {
+            throw new http.ScriptException(http.HttpStatus.HTTP_BAD_REQUEST, `Articulo '${ItemInfo.ItemName}' (${ItemInfo.ItemCode}) exento de impuesto no debe tener rubro`)
+        }
+        
+        // if internal client, check if allowed
+        if (BusinessPartner.Affiliate && !ItemInfo.AllowAffiliate) {
+            throw new http.ScriptException(http.HttpStatus.HTTP_BAD_REQUEST, `Articulo '${ItemInfo.ItemName}' (${ItemInfo.ItemCode}) no permitido para consumo de affiliados`)
+        }
+
+        // Item VAT Liable if
+        // Item itself not exempt and
+        // Business Partner not exempt or no VAT Exempt TaxSerie exists for this sales point 
+        const ItemVatLiable = ItemInfo.VatLiable &&
+            !BusinessPartner.Affiliate &&
+            (BusinessPartner.VatLiable || !Branch.GPOS_TAXSERIESCollection.some(TaxSeries => TaxSeries.U_TaxGroup === ItemInfo.TaxGroup && TaxSeries.U_VATExempt === 1))
+        
+        return {
+            ItemCode: Item.ItemCode,
+            Quantity: Item.Quantity,
+            PriceAfterVAT: Item.Price,
+            CostingCode: SalesPointItem.U_CostingCode,
+            CostingCode2: SalesPointItem.U_CostingCode2,
+            WarehouseCode: SalesPointItem.U_WarehouseCode,
+            SalesPersonCode: SalesPersonCode,
+            TaxCode: ItemVatLiable ? 'IVA' : 'IVA_EXE',
+            TaxLiable: ItemVatLiable ? 'tYES' : 'tNO'
+        }
+    })
+
+    const OldOrder = unwrapOperation(ctx.get('Orders', OperationContext.Data.PurchaseOrderDocEntry))
+
+    if (OldOrder.U_GPOS_Type !== ORDER_TYPE_TABLE_OPEN) throw new http.ScriptException(http.HttpStatus.HTTP_BAD_REQUEST, `No se puede actualizar que no este abierta. Para aggregar mas articulos se debe reabrir la mesa`)
+
+    const OldOrderLineCount = OldOrder.DocumentLines.length
+
+    const OrderInput = {
+        U_GPOS_Type: OrderType,
+        DocumentLines: DocumentLines.map((Line, index) => Object.assign(Line, { LineNum: index + OldOrderLineCount}))
+    }
+    
+    unwrapOperation(ctx.update('Orders', OrderInput, OperationContext.Data.PurchaseOrderDocEntry))
+
+    return {
+        Order: Object.assign(OldOrder, OrderInput, { DocumentLines: OldOrder.DocumentLines.concat(OrderInput.DocumentLines) })
     }
 }
 function createSale (ctx, Invoice, Items, OperationContext) {
@@ -369,8 +429,9 @@ function createSale (ctx, Invoice, Items, OperationContext) {
     if (Invoice.Payment) {
         const TotalPaidInCents = Invoice.Payment.PaymentCreditCards.reduce((total, Payment) => total + (Payment.CreditSum * 100), Invoice.Payment.CashSum * 100)
         const TotalPaid = TotalPaidInCents ? TotalPaidInCents / 100 : 0
-        
-        const TotalToPayInCents = Items.reduce((total, Item) => total + ((Item.PriceAfterVAT * 100) * Item.Quantity), 0)
+
+        const TotalToPayInCents = Items.reduce((total, Item) => total + ((Item.Price * 100) * Item.Quantity), 0)
+        console.log('Total topay in cents', TotalToPayInCents)
         const TotalToPay = TotalToPayInCents ? TotalToPayInCents / 100 : 0
         
         if (TotalToPay !== TotalPaid) {
@@ -425,10 +486,12 @@ function createSale (ctx, Invoice, Items, OperationContext) {
             throw new http.ScriptException(http.HttpStatus.HTTP_BAD_REQUEST, `Articulo '${ItemInfo.ItemName}' (${ItemInfo.ItemCode}) no permitido para consumo a credito`)
         }
 
+
+        
         Invoices[ItemTaxGroup].DocumentLines.push({
             ItemCode: Item.ItemCode,
             Quantity: Item.Quantity,
-            PriceAfterVAT: Item.PriceAfterVAT,
+            PriceAfterVAT: Item.Price,
             CostingCode: Item.CostingCode,
             CostingCode2: Item.CostingCode2,
             WarehouseCode: Item.U_WarehouseCode,
@@ -439,12 +502,12 @@ function createSale (ctx, Invoice, Items, OperationContext) {
             BaseLine: Item.LineNum,
             TaxCode: ItemVatLiable && TaxSerieVatLiable ? 'IVA' : 'IVA_EXE',
             TaxLiable: ItemVatLiable && TaxSerieVatLiable ? 'tYES' : 'tNO',
-            DocumentLineAdditionalExpenses: ItemVatLiable && !BusinessPartner.Affiliate ? getAdditionalExpenses (Item.PriceAfterVAT, Item.Quantity) : []
+            DocumentLineAdditionalExpenses: ItemVatLiable && !BusinessPartner.Affiliate ? getAdditionalExpenses (Item.Price, Item.Quantity) : []
         })
         
         return Invoices
     }, {})
-
+    
     const Invoices = Object.keys(InvoiceInputs).map(TaxGroup => {
         const AdditionalInvoiceInformation = {}
         const InvoiceInput = InvoiceInputs[TaxGroup]
@@ -463,20 +526,20 @@ function createSale (ctx, Invoice, Items, OperationContext) {
                 AdditionalInvoiceInformation.U_EXENTO = InvoiceTotal
             }
             
-            AdditionalInvoiceInformation.NumAtCard = InvoiceNumber,
-            AdditionalInvoiceInformation.U_NROAUTOR = TaxSerie.U_NROORDEN,
-            AdditionalInvoiceInformation.U_FECHALIM = normalizeDate(TaxSerie.U_FECHAFINVIGENCIA),
-            AdditionalInvoiceInformation.U_GPOS_TaxSeriesCode = TaxSerie.Code,
-            AdditionalInvoiceInformation.U_NRO_FAC = InvoiceNumber,
+            AdditionalInvoiceInformation.NumAtCard = InvoiceNumber
+            AdditionalInvoiceInformation.U_NROAUTOR = TaxSerie.U_NROORDEN
+            AdditionalInvoiceInformation.U_FECHALIM = normalizeDate(TaxSerie.U_FECHAFINVIGENCIA)
+            AdditionalInvoiceInformation.U_GPOS_TaxSeriesCode = TaxSerie.Code
+            AdditionalInvoiceInformation.U_NRO_FAC = InvoiceNumber
             AdditionalInvoiceInformation.U_CODCTRL = generateCode(TaxSerie.U_NROORDEN, String(InvoiceNumber), InvoiceInput.U_NIT, InvoiceInput.DocDate, InvoiceTotal, TaxSerie.U_LLAVE)
             AdditionalInvoiceInformation.U_TIPODOC = DOCTYPE_SALES
         } else {
             AdditionalInvoiceInformation.U_TIPODOC = DOCTYPE_NONE
         }
-
+        
         return unwrapOperation(ctx.Invoices.add(Object.assign(InvoiceInput, AdditionalInvoiceInformation)))
     })
-
+    
     // add 1 to Current invoice number.
     // All invoices from single sale share the same number
     // side effect happening here
@@ -509,8 +572,8 @@ function OPERATION_QUICKSALE (ctx, Data, Test, Operation) {
     const { Order } = createOrder(ctx, OperationContext.Data.Items, ORDER_TYPE_QUICKSALE, OperationContext)
     
     OperationContext.Branch = unwrapOperation(ctx.get('GPosBranch', OperationContext.SalesPoint.U_BranchCode), 'Sucursal')
-    OperationContext.TaxSeries = getOperationTaxSeries(ctx, Order.DocumentLines, OperationContext)
-    
+    OperationContext.TaxSeries = getOperationTaxSeries(ctx, Order.DocumentLines, OperationContext)        
+
     // this function has side effects
     const { Invoices, Payment } = createSale(ctx, Data.Invoice, getSaleItemsFromOrder(Order), OperationContext)
 
@@ -528,15 +591,175 @@ function OPERATION_QUICKSALE (ctx, Data, Test, Operation) {
     
     http.response.send(http.HttpStatus.HTTP_CREATED, {
         Test,
-        // Order,
-        // Invoices,
-        // Payment,
+        Order: { DocEntry: Order.DocEntry },
+        Invoices: Invoices.map(Invoice => ({ DocEntry: Invoice.DocEntry })),
         Print: {
             Orders: PrintOrders,
             Invoices: PrintInvoices
         }
     })
 }
+
+function OPERATION_TABLE_CREATE (ctx, Data, Test, Operation) {
+    const OperationContext = getOperationContext(ctx, Data, Test, Operation)
+    ctx.startTransaction()
+    
+    OperationContext.SalesPoint = getOperationSalesPoint(ctx, OperationContext)
+
+    const tableStatus = Data.Close ? ORDER_TYPE_TABLE_CLOSED : ORDER_TYPE_TABLE_OPEN
+    
+    // this function has side effects
+    const { Order } = createOrder(ctx, OperationContext.Data.Items, tableStatus, OperationContext)
+
+    updateOperationSalesPoint(ctx, OperationContext)
+
+    const PrintOrders = getPrintOrders(OperationContext.Data.Items, Order, OperationContext)
+
+    if (Test) {
+        ctx.rollbackTransaction()
+    } else {
+        ctx.commitTransaction()
+    }
+    
+    http.response.send(http.HttpStatus.HTTP_CREATED, {
+        Test,
+        Print: {
+            Orders: PrintOrders,
+        }
+    })
+}
+function OPERATION_TABLE_UPDATE (ctx, Data, Test, Operation) {
+    const OperationContext = getOperationContext(ctx, Data, Test, Operation)
+    ctx.startTransaction()
+    
+    OperationContext.SalesPoint = getOperationSalesPoint(ctx, OperationContext)
+
+    const tableStatus = Data.Close ? ORDER_TYPE_TABLE_CLOSED : ORDER_TYPE_TABLE_OPEN
+    
+    // this function has side effects
+    const { Order } = updateOrder(ctx, OperationContext.Data.Items, tableStatus, OperationContext)
+
+    const PrintOrders = getPrintOrders(OperationContext.Data.Items, Order, OperationContext)
+
+    if (Test) {
+        ctx.rollbackTransaction()
+    } else {
+        ctx.commitTransaction()
+    }
+    
+    http.response.send(http.HttpStatus.HTTP_OK, {
+        Test,
+        Print: {
+            Orders: PrintOrders,
+        }
+    })
+}
+function OPERATION_TABLE_CLOSE (ctx, Data, Test, Operation) {
+    const OperationContext = getOperationContext(ctx, Data, Test, Operation)
+    ctx.startTransaction()
+
+    const OldOrder = unwrapOperation(ctx.get('Orders', OperationContext.Data.PurchaseOrderDocEntry))
+
+    if (OldOrder.U_GPOS_Type !== ORDER_TYPE_TABLE_OPEN) throw new http.ScriptException(http.HttpStatus.HTTP_BAD_REQUEST, `No se cerrar mesa que no este abierta.`)
+    
+    unwrapOperation(ctx.update('Orders', { U_GPOS_Type: ORDER_TYPE_TABLE_CLOSED }, OperationContext.Data.PurchaseOrderDocEntry))
+    
+    if (Test) {
+        ctx.rollbackTransaction()
+    } else {
+        ctx.commitTransaction()
+    }
+    
+    http.response.send(http.HttpStatus.HTTP_OK, {
+        Test
+    })
+}
+function OPERATION_TABLE_REOPEN (ctx, Data, Test, Operation) {
+    const OperationContext = getOperationContext(ctx, Data, Test, Operation)
+
+    ctx.startTransaction()
+    
+    const OldOrder = unwrapOperation(ctx.get('Orders', OperationContext.Data.PurchaseOrderDocEntry))
+    
+    if (OldOrder.U_GPOS_Type !== ORDER_TYPE_TABLE_CLOSED) throw new http.ScriptException(http.HttpStatus.HTTP_BAD_REQUEST, `No se puede reabrir mesa que no este cerrada.`)
+
+    unwrapOperation(ctx.update('Orders', { U_GPOS_Type: ORDER_TYPE_TABLE_OPEN }, OperationContext.Data.PurchaseOrderDocEntry))
+
+    if (Test) {
+        ctx.rollbackTransaction()
+    } else {
+        ctx.commitTransaction()
+    }
+    
+    http.response.send(http.HttpStatus.HTTP_OK, {
+        Test
+    })
+}
+function OPERATION_TABLE_CANCEL (ctx, Data, Test, Operation) {
+    const OperationContext = getOperationContext(ctx, Data, Test, Operation)
+
+    ctx.startTransaction()
+    
+    const OldOrder = unwrapOperation(ctx.get('Orders', OperationContext.Data.PurchaseOrderDocEntry))
+    
+    if (OldOrder.U_GPOS_Type !== ORDER_TYPE_TABLE_OPEN && OldOrder.U_GPOS_Type !== ORDER_TYPE_TABLE_CLOSED) {
+        throw new http.ScriptException(http.HttpStatus.HTTP_BAD_REQUEST, `Solo se puede anular mesa abierta o cerrada.`)
+    }
+
+    unwrapOperation(ctx.update('Orders', { U_GPOS_Type: ORDER_TYPE_TABLE_CANCELLED  }, OperationContext.Data.PurchaseOrderDocEntry))
+
+    if (Test) {
+        ctx.rollbackTransaction()
+    } else {
+        ctx.commitTransaction()
+    }
+    
+    http.response.send(http.HttpStatus.HTTP_OK, {
+        Test
+    })
+}
+function OPERATION_TABLE_CHECKOUT (ctx, Data, Test, Operation) {
+    const OperationContext = getOperationContext(ctx, Data, Test, Operation)
+
+    const { DocumentLines } = unwrapOperation(ctx.get('Orders', Data.PurchaseOrderDocEntry))
+    OperationContext.ItemsInfo = getItemsInfo(ctx, DocumentLines)
+
+    ctx.startTransaction()
+    
+    OperationContext.SalesPoint = getOperationSalesPoint(ctx, OperationContext)
+    
+    const Order = unwrapOperation(ctx.get('Orders', Data.PurchaseOrderDocEntry))
+
+    if (Order.U_GPOS_Type !== ORDER_TYPE_TABLE_CLOSED)throw new http.ScriptException(http.HttpStatus.HTTP_BAD_REQUEST, `No se facturar mesa que no este cerrada.`)
+    
+    unwrapOperation(ctx.update('Orders', { U_GPOS_Type: ORDER_TYPE_TABLE_INVOICED  }, OperationContext.Data.PurchaseOrderDocEntry))
+
+    OperationContext.Branch = unwrapOperation(ctx.get('GPosBranch', OperationContext.SalesPoint.U_BranchCode), 'Sucursal')
+    OperationContext.TaxSeries = getOperationTaxSeries(ctx, Order.DocumentLines, OperationContext)        
+    
+    // this function has side effects
+    const { Invoices, Payment } = createSale(ctx, Data.Invoice, getSaleItemsFromOrder(Order), OperationContext)
+
+    updateOperationSalesPoint(ctx, OperationContext)
+    updateOperationTaxSeries(ctx, OperationContext)
+
+    const PrintInvoices = getPrintInvoices(Invoices, Payment, OperationContext)
+
+    if (Test) {
+        ctx.rollbackTransaction()
+    } else {
+        ctx.commitTransaction()
+    }
+    
+    http.response.send(http.HttpStatus.HTTP_CREATED, {
+        Test,
+        Invoices: Invoices.map(Invoice => ({ DocEntry: Invoice.DocEntry })),
+        Print: {
+            Invoices: PrintInvoices
+        }
+    })
+}
+
 function GET () {
     http.response.send(http.HttpStatus.HTTP_OK, 'Extension GuembePOS is up and running!')
 }
@@ -545,8 +768,14 @@ function POST () {
         const requestPayload = http.request.getJsonObj()
 
         switch (requestPayload.Operation) {
-            // case 'QUICKSALE': return OPERATION_QUICKSALE(ctx, requestPayload.Data, requestPayload.Test)
             case 'QUICKSALE': return OPERATION_QUICKSALE(ctx, requestPayload.Data, requestPayload.Test, requestPayload.Operation)
+            case 'TABLE_CREATE': return OPERATION_TABLE_CREATE(ctx, requestPayload.Data, requestPayload.Test, requestPayload.Operation)
+            case 'TABLE_UPDATE': return OPERATION_TABLE_UPDATE(ctx, requestPayload.Data, requestPayload.Test, requestPayload.Operation)
+            case 'TABLE_CLOSE': return OPERATION_TABLE_CLOSE(ctx, requestPayload.Data, requestPayload.Test, requestPayload.Operation)
+            case 'TABLE_REOPEN': return OPERATION_TABLE_REOPEN(ctx, requestPayload.Data, requestPayload.Test, requestPayload.Operation)
+            case 'TABLE_CANCEL': return OPERATION_TABLE_CANCEL(ctx, requestPayload.Data, requestPayload.Test, requestPayload.Operation)
+            case 'TABLE_CHECKOUT': return OPERATION_TABLE_CHECKOUT(ctx, requestPayload.Data, requestPayload.Test, requestPayload.Operation)
+
             default: throw new http.ScriptException(http.HttpStatus.HTTP_BAD_REQUEST, `Unknown or unimplemented Operation: ${requestPayload.Operation}`)
         }
     })
