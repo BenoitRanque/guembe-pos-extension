@@ -10,7 +10,7 @@
     OnDemand=""
     OnPremise=""
     ExtName="Guembe POS"
-    ExtVersion="1.2.0"
+    ExtVersion="1.3.1"
     Contdata="sa"
     Partner="Guembe"
     DBType="HANA"

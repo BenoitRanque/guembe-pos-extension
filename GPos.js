@@ -237,12 +237,28 @@ function getPrintOrders(Items, Order, OperationContext) {
         Printers[SalesPointItem.U_Printer].DocumentLines.push({
             ItemCode: Item.ItemCode,
             ItemDescription: ItemInfo.ItemName,
-            Quantity: Item.Quantity
+            Quantity: Item.Quantity,
+            Price: Item.Price
         })
 
         return Printers
     }, {})
     return Object.keys(Printers).map(Printer => Printers[Printer])
+}
+function getPrintReceipt(Order, OperationContext) {
+    return {
+        DocDate: Order.DocDate,
+        DocTotal: Order.DocTotal,
+        SalesPersonCode: Order.SalesPersonCode,
+        U_GPOS_Serial: Order.U_GPOS_Serial,
+        U_GPOS_SalesPointCode: Order.U_GPOS_SalesPointCode,
+        DocumentLines: Order.DocumentLines.map(line => ({
+            ItemCode: line.ItemCode,
+            ItemDescription: line.ItemDescription,
+            Quantity: line.Quantity,
+            Price: line.PriceAfterVAT
+        }))
+    }
 }
 function getPrintInvoices(Invoices, Payment, OperationContext) {
     const { TaxSeries } = OperationContext
@@ -614,6 +630,7 @@ function OPERATION_TABLE_CREATE (ctx, Data, Test, Operation) {
     updateOperationSalesPoint(ctx, OperationContext)
 
     const PrintOrders = getPrintOrders(OperationContext.Data.Items, Order, OperationContext)
+    const PrintReceipt = getPrintReceipt(Order, OperationContext)
 
     if (Test) {
         ctx.rollbackTransaction()
@@ -625,6 +642,7 @@ function OPERATION_TABLE_CREATE (ctx, Data, Test, Operation) {
         Test,
         Print: {
             Orders: PrintOrders,
+            Receipt: tableStatus === ORDER_TYPE_TABLE_CLOSED ? PrintReceipt : null
         }
     })
 }
@@ -640,6 +658,7 @@ function OPERATION_TABLE_UPDATE (ctx, Data, Test, Operation) {
     const { Order } = updateOrder(ctx, OperationContext.Data.Items, tableStatus, OperationContext)
 
     const PrintOrders = getPrintOrders(OperationContext.Data.Items, Order, OperationContext)
+    const PrintReceipt = getPrintReceipt(Order, OperationContext)
 
     if (Test) {
         ctx.rollbackTransaction()
@@ -651,6 +670,7 @@ function OPERATION_TABLE_UPDATE (ctx, Data, Test, Operation) {
         Test,
         Print: {
             Orders: PrintOrders,
+            Receipt: tableStatus === ORDER_TYPE_TABLE_CLOSED ? PrintReceipt : null
         }
     })
 }
@@ -664,6 +684,8 @@ function OPERATION_TABLE_CLOSE (ctx, Data, Test, Operation) {
     
     unwrapOperation(ctx.update('Orders', { U_GPOS_Type: ORDER_TYPE_TABLE_CLOSED }, OperationContext.Data.PurchaseOrderDocEntry))
     
+    const PrintReceipt = getPrintReceipt(OldOrder)
+
     if (Test) {
         ctx.rollbackTransaction()
     } else {
@@ -671,7 +693,10 @@ function OPERATION_TABLE_CLOSE (ctx, Data, Test, Operation) {
     }
     
     http.response.send(http.HttpStatus.HTTP_OK, {
-        Test
+        Test,
+        Print: {
+            Receipt: PrintReceipt
+        }
     })
 }
 function OPERATION_TABLE_REOPEN (ctx, Data, Test, Operation) {
